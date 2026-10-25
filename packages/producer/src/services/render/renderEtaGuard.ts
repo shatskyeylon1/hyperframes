@@ -1,5 +1,3 @@
-const RENDER_TOO_SLOW = "RENDER_TOO_SLOW" as const;
-
 /** Fail only when the ETA clears the budget by this factor, so borderline renders survive. */
 const ETA_MARGIN = 1.2;
 /** The measured rate needs this much capture time and frames; the first frame's warm-up is excluded. */
@@ -19,7 +17,7 @@ interface RenderEtaInput {
 }
 
 export class RenderTooSlowError extends Error {
-  readonly code = RENDER_TOO_SLOW;
+  readonly code = "RENDER_TOO_SLOW";
   // The producer server reads these off the error for the wire envelope.
   // fallow-ignore-next-line unused-class-member
   readonly owner = "user" as const;
@@ -60,37 +58,27 @@ interface RenderEtaGuardOptions {
   pollMs?: number;
 }
 
-/** Measured wall ms per frame once enough capture time and frames are in; a counter reset restarts the sample. */
-function createRateSampler() {
-  let base: { at: number; frames: number } | undefined;
-  let lastFrames = 0;
-  return {
-    observe(done: number, at: number): number | undefined {
-      if (done === 0 || done < lastFrames) base = undefined;
-      lastFrames = done;
-      if (done === 0) return undefined;
-      base ??= { at, frames: done };
-      const sampleMs = at - base.at;
-      const sampleFrames = done - base.frames;
-      if (sampleMs < MIN_SAMPLE_MS || sampleFrames < MIN_SAMPLE_FRAMES) return undefined;
-      return sampleMs / sampleFrames;
-    },
-  };
-}
-
 /** Polls `job.framesRendered`, which every capture path updates, and trips once. Returns stop(). */
 export function startRenderEtaGuard(options: RenderEtaGuardOptions): () => void {
   const { maxRenderMs, job, totalFrames, pipelineStartMs, onTooSlow, now = Date.now } = options;
   if (!maxRenderMs || maxRenderMs <= 0) return () => {};
-  const sampler = createRateSampler();
+  // The rate is measured from the first frame seen (warm-up excluded); a counter reset restarts the sample.
+  let base: { at: number; frames: number } | undefined;
+  let lastFrames = 0;
   const stop = () => clearInterval(timer);
   const timer = setInterval(() => {
     const done = job.framesRendered ?? 0;
     // Capture is complete: encode and assemble are not frame-driven, so the guard has nothing left to judge.
     if (done >= totalFrames) return stop();
     const at = now();
-    const msPerFrame = sampler.observe(done, at);
-    if (msPerFrame === undefined) return;
+    if (done === 0 || done < lastFrames) base = undefined;
+    lastFrames = done;
+    if (done === 0) return;
+    base ??= { at, frames: done };
+    const sampleMs = at - base.at;
+    const sampleFrames = done - base.frames;
+    if (sampleMs < MIN_SAMPLE_MS || sampleFrames < MIN_SAMPLE_FRAMES) return;
+    const msPerFrame = sampleMs / sampleFrames;
     const error = checkRenderEta("capture", {
       maxRenderMs,
       elapsedMs: at - pipelineStartMs,
